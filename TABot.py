@@ -2,6 +2,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import re
+import mysql.connector
 
 # List of course names
 COURSE_CHOICES = ["C1 Inwards", "C1 Outwards", "New Belt (CCW)", "New Belt (CW)", "Shibuya/Shinjuku", "Ikebukuro/Yamate", "Wangan (East)", "Wangan (West)",
@@ -10,11 +11,16 @@ COURSE_CHOICES = ["C1 Inwards", "C1 Outwards", "New Belt (CCW)", "New Belt (CW)"
                   "Hakone Inwards", "Hakone Outwards", "Hakone Mt. Taikan (Upwards)", "Hakone Mt. Taikan (Downwards)", "Metro Highway Tokyo",
                   "Metro Highway Kanagawa"]
 
+db = mysql.connector.connect(
+    host="localhost",
+    user="kurt",
+    password="Kurteekurt123!",
+    database="WMMT"
+)
+cursor = db.cursor()
+
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-# { course_name: { user_id: (best_time_seconds, display_name) } }
-leaderboards = {}
 
 # Regex for times like 1:23.456 or 59.999 (milliseconds)
 time_pattern = re.compile(r'^(?:(\d+):)?(\d{1,2})\.(\d{3})$')
@@ -35,12 +41,16 @@ def parse_time_string(time_str: str):
 
 @bot.tree.command(name="submit_time", description="Submit your best time for a course")
 @app_commands.describe(
+    user="The Discord user submitting the time",
     time="Your time in MM:SS.xxx or SS.xxx format",
     course="The name of the course (map/track)"
 )
 @app_commands.choices(course=[app_commands.Choice(name=c, value=c) for c in COURSE_CHOICES])
-async def submit_time(interaction: discord.Interaction, time: str, course: app_commands.Choice[str]):
+async def submit_time(interaction: discord.Interaction, user: discord.User, time: str, course: app_commands.Choice[str]):
     await interaction.response.defer()
+    if not interaction.user.guild_permissions.administrator and not interaction.user.guild_permissions.manage_messages:
+        await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
+        return
     course = course.value
     total_seconds = parse_time_string(time)
     if total_seconds is None:
@@ -50,17 +60,33 @@ async def submit_time(interaction: discord.Interaction, time: str, course: app_c
         return
 
     course = course.strip().title()
-    user_id = interaction.user.id
-    display_name = interaction.user.display_name
+    user_id = user.id
+    display_name = user.display_name
 
-    if course not in leaderboards:
-        leaderboards[course] = {}
+    cursor.execute("""
+        SELECT time_seconds FROM leaderboard
+        WHERE discord_user_id = %s AND course_name = %s
+    """, (user_id, course))
+    result = cursor.fetchone()
 
-    if user_id not in leaderboards[course] or total_seconds < leaderboards[course][user_id][0]:
-        leaderboards[course][user_id] = (total_seconds, display_name)
-        lines = [f"✅ Time submitted for **{course}**: **{time}**", f"🏁 **Leaderboard for {course}:**"]
-        sorted_times = sorted(leaderboards[course].items(), key=lambda x: x[1][0])
-        for rank, (user_id, (time_sec, name)) in enumerate(sorted_times, 1):
+    if result is None or total_seconds < result[0]:
+        cursor.execute("""
+            INSERT INTO leaderboard (discord_user_id, display_name, course_name, time_seconds)
+            VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE time_seconds = VALUES(time_seconds), display_name = VALUES(display_name)
+        """, (user_id, display_name, course, total_seconds))
+        db.commit()
+        lines = [f"✅ {display_name} submitted **{time}** for **{course}**", f"🏁 **Leaderboard for {course}:**"]
+
+        cursor.execute("""
+            SELECT display_name, time_seconds FROM leaderboard
+            WHERE course_name = %s
+            ORDER BY time_seconds ASC
+            LIMIT 10
+        """, (course,))
+        results = cursor.fetchall()
+
+        for rank, (name, time_sec) in enumerate(results, 1):
             minutes = int(time_sec) // 60
             seconds = time_sec % 60
             formatted = f"{minutes}:{seconds:06.3f}" if minutes else f"{seconds:.3f}"
@@ -68,7 +94,7 @@ async def submit_time(interaction: discord.Interaction, time: str, course: app_c
 
         await interaction.followup.send("\n".join(lines))
     else:
-        existing_time = leaderboards[course][user_id][0]
+        existing_time = result[0]
         await interaction.followup.send(
             f"🕒 You already have a faster time for **{course}**: **{existing_time:.3f} seconds**",
             ephemeral=True
@@ -80,19 +106,26 @@ async def submit_time(interaction: discord.Interaction, time: str, course: app_c
 async def leaderboard(interaction: discord.Interaction, course: app_commands.Choice[str]):
     course = course.value
     course = course.strip().title()
-    if course not in leaderboards or not leaderboards[course]:
+
+    cursor.execute("""
+        SELECT display_name, time_seconds FROM leaderboard
+        WHERE course_name = %s
+        ORDER BY time_seconds ASC
+        LIMIT 10
+    """, (course,))
+    results = cursor.fetchall()
+
+    if not results:
         await interaction.response.send_message(f"❌ No times submitted yet for **{course}**.")
         return
 
-    sorted_times = sorted(leaderboards[course].items(), key=lambda x: x[1][0])
     lines = [f"🏁 **Leaderboard for {course}:**"]
-    for rank, (user_id, (time_sec, name)) in enumerate(sorted_times, 1):
+    for rank, (name, time_sec) in enumerate(results, 1):
         minutes = int(time_sec) // 60
         seconds = time_sec % 60
         formatted = f"{minutes}:{seconds:06.3f}" if minutes else f"{seconds:.3f}"
         lines.append(f"{rank}. {name} – {formatted}")
-
     await interaction.response.send_message("\n".join(lines))
 
 # Replace this with your real token (keep it secret!)
-bot.run("MTM5NDIyNjM0NDg5MTY1MDA4MA.GC3gBO.__xhvXI5WsMYh9sOVUE43D4Z3odPr_3ffuD_vs")
+bot.run("YOUR_DISCORD_BOT_TOKEN")
